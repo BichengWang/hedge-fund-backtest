@@ -56,6 +56,7 @@ from backtest.factor_model import (
     decompose_returns,
     print_factor_report,
 )
+from backtest.report import generate_report
 
 # ── configuration ──────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("output")
@@ -65,7 +66,7 @@ TICKERS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE"
 START_DATE = "2010-01-01"
 END_DATE = "2024-12-31"
 
-MOMENTUM_LOOKBACK = 20       # days for momentum signal
+MOMENTUM_LOOKBACK = 60       # days for momentum signal (60-day window)
 TOP_PCT = 0.3                # top/bottom 30% for L/S legs (larger with 11 ETFs)
 TARGET_VOL = 0.12            # 12% annualised target vol
 MAX_POSITION = 0.20          # max 20% per asset
@@ -73,6 +74,14 @@ N_PAIRS = 5                  # number of cointegrated pairs to trade
 TRAIN_DAYS = 504             # ~2 years
 TEST_DAYS = 63               # ~3 months
 STEP_DAYS = 21               # ~1 month
+
+# Sector groupings for sector-neutral portfolio construction
+# (groups sector ETFs into broader themes so sector-neutral z-scoring has effect)
+SECTORS = {
+    "XLK": "growth",   "XLY": "growth",  "XLF": "growth",   "XLC": "growth",
+    "XLI": "cyclical", "XLB": "cyclical", "XLE": "cyclical",
+    "XLV": "defensive", "XLP": "defensive", "XLU": "defensive", "XLRE": "defensive",
+}
 
 plt.style.use("seaborn-v0_8-darkgrid")
 sns.set_palette("husl")
@@ -110,11 +119,14 @@ def run_momentum_strategy(prices: pd.DataFrame, returns: pd.DataFrame):
     print("="*60)
 
     def momentum_signal_func(px: pd.DataFrame) -> pd.DataFrame:
-        return momentum_signal(px, lookback=MOMENTUM_LOOKBACK)
+        return momentum_signal(px, lookback=MOMENTUM_LOOKBACK, weekly_only=True)
 
     print(f"  Lookback window : {MOMENTUM_LOOKBACK} days")
     print(f"  L/S leg size    : top/bottom {TOP_PCT*100:.0f}%")
     print(f"  Target vol      : {TARGET_VOL*100:.0f}%")
+    print(f"  Weekly signals  : True (rebalance on Mondays only)")
+    print(f"  Regime filter   : True (go flat in bear markets)")
+    print(f"  Sector neutral  : True (normalise within growth/cyclical/defensive)")
     print(f"  Running backtest ...")
 
     mom_returns, mom_weights = run_backtest(
@@ -125,6 +137,9 @@ def run_momentum_strategy(prices: pd.DataFrame, returns: pd.DataFrame):
         max_position=MAX_POSITION,
         asset_class="us_equity_etf",
         apply_vol_scaling=True,
+        use_regime_filter=True,
+        sector_neutral=True,
+        sectors=SECTORS,
     )
 
     metrics = calculate_metrics(mom_returns)
@@ -132,6 +147,8 @@ def run_momentum_strategy(prices: pd.DataFrame, returns: pd.DataFrame):
 
     avg_turnover = compute_turnover(mom_weights).mean()
     print(f"  Avg daily turnover: {avg_turnover*100:.2f}%  ({avg_turnover*252*100:.0f}% annualised)")
+
+    generate_report(mom_returns, "momentum", OUTPUT_DIR)
 
     return mom_returns, mom_weights, metrics
 
@@ -150,7 +167,12 @@ def run_pairs_strategy(prices: pd.DataFrame, returns: pd.DataFrame):
     discovery_prices = prices.iloc[:mid_idx]
     print(f"  Pair discovery window: {discovery_prices.index[0].date()} to {discovery_prices.index[-1].date()}")
 
-    pairs = find_cointegrated_pairs(discovery_prices, significance=0.10)
+    pairs = find_cointegrated_pairs(
+        discovery_prices,
+        significance=0.10,
+        min_half_life=5.0,
+        max_half_life=60.0,
+    )
 
     if not pairs:
         print("  No cointegrated pairs found. Skipping pairs strategy.")
@@ -209,6 +231,8 @@ def run_pairs_strategy(prices: pd.DataFrame, returns: pd.DataFrame):
     metrics = calculate_metrics(pairs_net)
     print_metrics_table(metrics, "Pairs Trading")
 
+    generate_report(pairs_net, "pairs", OUTPUT_DIR)
+
     return pairs_net, signals_df, metrics
 
 
@@ -223,9 +247,9 @@ def run_walk_forward(prices: pd.DataFrame):
     print(f"  Train: {TRAIN_DAYS} days (~2yr)  |  Test: {TEST_DAYS} days (~3mo)  |  Step: {STEP_DAYS} days")
 
     def momentum_signal_func(px: pd.DataFrame) -> pd.DataFrame:
-        return momentum_signal(px, lookback=MOMENTUM_LOOKBACK)
+        return momentum_signal(px, lookback=MOMENTUM_LOOKBACK, weekly_only=True)
 
-    print("\n  [4a] Momentum strategy walk-forward ...")
+    print("\n  [4a] Momentum strategy walk-forward (with regime filter) ...")
     wf_results = walk_forward_backtest(
         prices,
         signal_func=momentum_signal_func,
@@ -236,6 +260,9 @@ def run_walk_forward(prices: pd.DataFrame):
         target_vol=TARGET_VOL,
         max_position=MAX_POSITION,
         asset_class="us_equity_etf",
+        use_regime_filter=True,
+        sector_neutral=True,
+        sectors=SECTORS,
     )
 
     if not wf_results:
@@ -539,6 +566,71 @@ def print_full_report(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SECTION 7 — COMBINED PORTFOLIO
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_combined_portfolio(
+    mom_returns: pd.Series,
+    pairs_returns: Optional[pd.Series],
+):
+    print("\n" + "="*60)
+    print("  SECTION 7: COMBINED PORTFOLIO")
+    print("="*60)
+    print("  Equal-weight combination of Momentum L/S + Pairs Trading")
+
+    strategies = [(r, n) for r, n in [
+        (mom_returns, "Momentum"),
+        (pairs_returns, "Pairs"),
+    ] if r is not None]
+
+    if not strategies:
+        print("  No strategies available for combination.")
+        return None
+
+    if len(strategies) == 1:
+        combined = strategies[0][0].rename("combined")
+        print(f"  Only one strategy available ({strategies[0][1]}); using it as combined.")
+    else:
+        rets_list = [r.rename(n) for r, n in strategies]
+        combined_df = pd.concat(rets_list, axis=1).dropna(how="all")
+        combined = combined_df.mean(axis=1)
+        combined.name = "combined"
+        print(f"  Combining: {[n for _, n in strategies]}")
+
+    metrics = calculate_metrics(combined)
+    print_metrics_table(metrics, "Combined Portfolio (equal-weight)")
+
+    # ── Equity curve ──────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.set_title("Combined Portfolio Equity Curve", fontsize=12)
+
+    cum_combined = (1 + combined.dropna()).cumprod()
+    ax.plot(cum_combined.index, cum_combined.values, color="purple",
+            linewidth=2, label="Combined (equal-weight)")
+
+    for ret, name, color in [
+        (mom_returns, "Momentum L/S", "steelblue"),
+        (pairs_returns, "Pairs Trading", "green"),
+    ]:
+        if ret is not None:
+            cum_s = (1 + ret.dropna()).cumprod()
+            ax.plot(cum_s.index, cum_s.values, linestyle="--", alpha=0.55,
+                    color=color, label=name)
+
+    ax.axhline(1.0, color="black", linewidth=0.7, linestyle=":")
+    ax.legend(loc="upper left")
+    ax.set_ylabel("Cumulative Return (gross of costs)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    plt.tight_layout()
+    path = OUTPUT_DIR / "combined_equity_curve.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {path}")
+
+    return combined
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -568,7 +660,10 @@ def main():
     # ── 6. Plots ─────────────────────────────────────────────────────────
     save_plots(prices, mom_returns, pairs_returns, oos_returns, wf_results)
 
-    # ── 7. Full Report ───────────────────────────────────────────────────
+    # ── 7. Combined Portfolio ─────────────────────────────────────────────
+    combined_returns = run_combined_portfolio(mom_returns, pairs_returns)
+
+    # ── Full Report ───────────────────────────────────────────────────────
     oos_metrics = calculate_metrics(oos_returns) if oos_returns is not None else {}
     print_full_report(
         mom_metrics,

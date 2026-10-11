@@ -24,8 +24,9 @@ from statsmodels.tsa.stattools import adfuller, coint
 
 def momentum_signal(
     prices: pd.DataFrame,
-    lookback: int = 20,
+    lookback: int = 60,
     skip_days: int = 1,
+    weekly_only: bool = True,
 ) -> pd.DataFrame:
     """
     Cross-sectional momentum signal, z-scored across assets each day.
@@ -35,9 +36,11 @@ def momentum_signal(
 
     Parameters
     ----------
-    prices   : price DataFrame (rows = dates, cols = assets)
-    lookback : momentum window in trading days
-    skip_days: days to skip before window (avoids 1-day reversal)
+    prices      : price DataFrame (rows = dates, cols = assets)
+    lookback    : momentum window in trading days (default 60)
+    skip_days   : days to skip before window (avoids 1-day reversal)
+    weekly_only : if True, only update signal on Mondays and forward-fill
+                  for Tue-Fri — reduces turnover by ~5x
 
     Returns
     -------
@@ -53,6 +56,12 @@ def momentum_signal(
     z = raw_mom.sub(raw_mom.mean(axis=1), axis=0).div(
         raw_mom.std(axis=1).replace(0, np.nan), axis=0
     )
+
+    if weekly_only:
+        # Keep signal only on Mondays (dayofweek == 0), forward-fill rest of week
+        is_monday = z.index.dayofweek == 0
+        z = z.loc[is_monday].reindex(z.index).ffill()
+
     return z
 
 
@@ -89,8 +98,8 @@ def _estimate_half_life(spread: pd.Series) -> float:
 def find_cointegrated_pairs(
     prices: pd.DataFrame,
     significance: float = 0.05,
-    min_half_life: float = 2.0,
-    max_half_life: float = 252.0,
+    min_half_life: float = 5.0,
+    max_half_life: float = 60.0,
 ) -> List[PairInfo]:
     """
     Scan all pairs for cointegration using the Engle-Granger test.

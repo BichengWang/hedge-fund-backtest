@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from typing import Optional
+from typing import Dict, Optional
 
 
 def build_long_short_portfolio(
@@ -17,6 +17,9 @@ def build_long_short_portfolio(
     prices: pd.DataFrame,
     top_pct: float = 0.2,
     dollar_neutral: bool = True,
+    regime_filter: Optional[pd.Series] = None,
+    sector_neutral: bool = True,
+    sectors: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
     Build a long/short portfolio from cross-sectional alpha signals.
@@ -26,19 +29,46 @@ def build_long_short_portfolio(
       - Short the bottom `top_pct` fraction.
       - Equal-weight within each leg.
       - Optionally enforce dollar-neutrality (long notional = short notional).
+      - Optionally go flat during bear regimes (regime_filter).
+      - Optionally normalise signals within sector groups (sector_neutral).
 
     Parameters
     ----------
-    signals      : z-scored signal DataFrame (rows=dates, cols=assets)
-    prices       : price DataFrame (used only to align index)
-    top_pct      : fraction of assets in each leg (e.g. 0.2 = top/bottom quintile)
-    dollar_neutral: if True, scale longs and shorts to equal notional
+    signals        : z-scored signal DataFrame (rows=dates, cols=assets)
+    prices         : price DataFrame (used only to align index)
+    top_pct        : fraction of assets in each leg (e.g. 0.2 = top/bottom quintile)
+    dollar_neutral : if True, scale longs and shorts to equal notional
+    regime_filter  : optional pd.Series of {"bull","bear","chop"} indexed by date.
+                     When provided, weights are zeroed on "bear" days.
+    sector_neutral : if True and sectors is provided, normalise signals within
+                     each sector group before ranking (reduces sector tilts).
+    sectors        : dict mapping ticker -> sector name.  Required for
+                     sector_neutral to have any effect.
 
     Returns
     -------
     pd.DataFrame of portfolio weights (same shape as signals).
     Positive = long, negative = short. Rows sum to ~0 (dollar-neutral).
     """
+    # ── Sector-neutral normalisation ─────────────────────────────────────
+    if sector_neutral and sectors is not None:
+        # Group tickers by sector and z-score within each group
+        sector_groups: Dict[str, list] = {}
+        for ticker in signals.columns:
+            sec = sectors.get(ticker, ticker)
+            sector_groups.setdefault(sec, []).append(ticker)
+
+        normed = signals.copy()
+        for tickers in sector_groups.values():
+            if len(tickers) < 2:
+                continue
+            sub = signals[tickers]
+            row_mean = sub.mean(axis=1)
+            row_std = sub.std(axis=1).replace(0, np.nan)
+            normed[tickers] = sub.sub(row_mean, axis=0).div(row_std, axis=0)
+        signals = normed
+
+    # ── Build weights ─────────────────────────────────────────────────────
     weights = pd.DataFrame(0.0, index=signals.index, columns=signals.columns)
     n_assets = signals.shape[1]
     n_leg = max(1, int(np.floor(n_assets * top_pct)))
@@ -65,6 +95,12 @@ def build_long_short_portfolio(
                 w[w < 0] *= avg / short_sum
 
         weights.loc[date] = w
+
+    # ── Regime filter: go flat in bear ────────────────────────────────────
+    if regime_filter is not None:
+        aligned_regime = regime_filter.reindex(weights.index).ffill().fillna("chop")
+        bear_days = aligned_regime == "bear"
+        weights.loc[bear_days] = 0.0
 
     return weights
 

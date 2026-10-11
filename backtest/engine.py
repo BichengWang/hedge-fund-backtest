@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -46,20 +46,26 @@ def run_backtest(
     max_position: float = 0.10,
     asset_class: str = "us_equity_etf",
     apply_vol_scaling: bool = True,
+    use_regime_filter: bool = True,
+    sector_neutral: bool = True,
+    sectors: Optional[Dict[str, str]] = None,
 ) -> Tuple[pd.Series, pd.DataFrame]:
     """
     Run a full backtest over the specified date range.
 
     Parameters
     ----------
-    prices       : price DataFrame
-    signal_func  : function(prices) -> signal DataFrame
-    start / end  : date range filter (ISO strings)
-    top_pct      : long/short portfolio leg size
-    target_vol   : annualized target volatility
-    max_position : per-asset position cap
-    asset_class  : cost model
+    prices            : price DataFrame
+    signal_func       : function(prices) -> signal DataFrame
+    start / end       : date range filter (ISO strings)
+    top_pct           : long/short portfolio leg size
+    target_vol        : annualized target volatility
+    max_position      : per-asset position cap
+    asset_class       : cost model
     apply_vol_scaling : whether to volatility-scale positions
+    use_regime_filter : if True, detect market regime and go flat in bear markets
+    sector_neutral    : passed through to build_long_short_portfolio
+    sectors           : ticker->sector mapping for sector_neutral
 
     Returns
     -------
@@ -77,7 +83,24 @@ def run_backtest(
     raw_signals = signal_func(prices)
     signals = raw_signals.shift(1)  # <-- critical: use yesterday's signal today
 
-    weights = build_long_short_portfolio(signals, prices, top_pct=top_pct)
+    # Regime detection (shift by 1 day to avoid look-ahead)
+    regime_filter = None
+    if use_regime_filter:
+        from backtest.regime import SimpleRegimeDetector
+        detector = SimpleRegimeDetector()
+        regime = detector.detect(prices)
+        regime_filter = regime.shift(1)
+        regime_counts = regime.value_counts().to_dict()
+        print(f"  [engine] Regime distribution: {regime_counts}")
+
+    weights = build_long_short_portfolio(
+        signals,
+        prices,
+        top_pct=top_pct,
+        regime_filter=regime_filter,
+        sector_neutral=sector_neutral,
+        sectors=sectors,
+    )
 
     if apply_vol_scaling:
         weights = volatility_scale_positions(weights, returns, target_vol=target_vol)
@@ -101,6 +124,9 @@ def walk_forward_backtest(
     max_position: float = 0.10,
     asset_class: str = "us_equity_etf",
     apply_vol_scaling: bool = True,
+    use_regime_filter: bool = True,
+    sector_neutral: bool = True,
+    sectors: Optional[Dict[str, str]] = None,
 ) -> List[WalkForwardResult]:
     """
     Walk-forward validation: train on in-sample data, evaluate on out-of-sample.
@@ -110,15 +136,24 @@ def walk_forward_backtest(
 
     Parameters
     ----------
-    train_days : number of trading days in each training window
-    test_days  : number of trading days in each test window
-    step_days  : number of days to advance the window each iteration
+    train_days        : number of trading days in each training window
+    test_days         : number of trading days in each test window
+    step_days         : number of days to advance the window each iteration
+    use_regime_filter : if True, go flat in bear regimes
+    sector_neutral    : passed through to build_long_short_portfolio
+    sectors           : ticker->sector mapping for sector_neutral
 
     Returns
     -------
     List of WalkForwardResult (one per test window)
     """
     from backtest.data import calculate_returns
+
+    # Pre-compute full-period regime once (regime uses only price history, no look-ahead)
+    full_regime = None
+    if use_regime_filter:
+        from backtest.regime import SimpleRegimeDetector
+        full_regime = SimpleRegimeDetector().detect(prices).shift(1)
 
     dates = prices.index
     n = len(dates)
@@ -161,6 +196,13 @@ def walk_forward_backtest(
             # Shift signals by 1 to avoid look-ahead
             combined_signals_lagged = combined_signals.shift(1)
 
+            # Slice regime to combined window
+            combined_regime = (
+                full_regime.reindex(combined_prices.index)
+                if full_regime is not None
+                else None
+            )
+
             # Slice to test period
             test_signals = combined_signals_lagged.loc[test_start:test_end]
             test_prices_slice = combined_prices.loc[test_start:test_end]
@@ -169,14 +211,28 @@ def walk_forward_backtest(
             ).loc[test_start:test_end]
 
             weights = build_long_short_portfolio(
-                test_signals, test_prices_slice, top_pct=top_pct
+                test_signals,
+                test_prices_slice,
+                top_pct=top_pct,
+                regime_filter=(
+                    combined_regime.loc[test_start:test_end]
+                    if combined_regime is not None
+                    else None
+                ),
+                sector_neutral=sector_neutral,
+                sectors=sectors,
             )
 
             if apply_vol_scaling:
                 # Use full combined returns for vol estimation
                 combined_returns = calculate_returns(combined_prices, method="log")
                 combined_weights = build_long_short_portfolio(
-                    combined_signals_lagged, combined_prices, top_pct=top_pct
+                    combined_signals_lagged,
+                    combined_prices,
+                    top_pct=top_pct,
+                    regime_filter=combined_regime,
+                    sector_neutral=sector_neutral,
+                    sectors=sectors,
                 )
                 combined_weights_scaled = volatility_scale_positions(
                     combined_weights, combined_returns, target_vol=target_vol
